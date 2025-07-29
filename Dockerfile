@@ -1,11 +1,11 @@
 # stage 1: compile the code to an executable
-FROM denoland/deno:2.2.12 AS builder
+
+FROM denoland/deno:2.4.2 AS builder
 WORKDIR /app
 COPY deno.json deno.lock* ./
 COPY bot.ts ./
 
-# Mount a cache directory to Deno's cache location
-# Replace /deno-dir if your Deno version uses a different default cache path inside the container
+# mount a cache directory to Deno's cache location
 RUN --mount=type=cache,target=/deno-dir deno cache --lock=deno.lock bot.ts
 RUN deno compile --allow-read --allow-write --allow-env --allow-net --allow-run --output bot_bin bot.ts
 

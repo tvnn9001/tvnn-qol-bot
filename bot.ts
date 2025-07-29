@@ -52,14 +52,16 @@ bot.api.setMyCommands([
 // Utility functions for logging and error handling
 
 /**
- * Is not a sufficiently good check
- * @param url
- * @returns
+ * Checks if the given string contains a YouTube URL and extracts the first match.
+ * @param text The string to search for a YouTube URL.
+ * @returns The extracted YouTube URL if found, otherwise undefined.
  */
-function isYoutubeURL(url: string) {
-    // Regular expression to match YouTube video URLs
-    const youtubeRegex = /(youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)/;
-    return youtubeRegex.test(url);
+function extractYoutubeURL(text: string): string | undefined {
+    // Regular expression to find and capture YouTube video URLs
+    const youtubeRegex = /(https?:\/\/(?:(?:www|music)\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)[\w-]{11}[^\s]*)/;
+    const match = text.match(youtubeRegex);
+    console.debug(match);
+    return match ? match[0] : undefined;
 }
 
 /**
@@ -68,7 +70,7 @@ function isYoutubeURL(url: string) {
 function ytdlpArgs(args: ArgsOptions): ArgsOptions {
     return {
         extractorArgs: {
-            "youtube": [`getpot_bgutil_baseurl=${process.env.BGUTIL_ROOT!}`],
+            "youtubepot-bgutilhttp": [`base_url=${process.env.BGUTIL_ROOT!}`],
         },
         cookies: "cookies.txt",
         ...args,
@@ -108,7 +110,7 @@ function getInform(ctx: Context, msg_id: number) {
     return (
             msg: string,
             other?: Parameters<typeof ctx.api.editMessageText>[3],
-        ) => { 
+        ) => {
             ctx.api.editMessageText(ctx.chatId!, msg_id, msg, {
                 parse_mode: "HTML",
                 ...other,
@@ -143,8 +145,11 @@ const errorMessages = {
 /**
  * Returns the text of the error for the given category and the error log.
  */
-const fullErrorMessage = (errorCategory: keyof typeof errorMessages, e: any) =>
-    errorMessages[errorCategory] + `\nError log: ${e}`;
+const fullErrorMessage = (errorCategory: keyof typeof errorMessages, e: any) => {
+    // Remove HTML tags from the error 
+    const sanitizedError = String(e).replace(/<[^>]*>/g, "");
+    return errorMessages[errorCategory] + `\nError log: ${sanitizedError}`;
+};
 
 // ------------------- LOGGING UTILS END ----------------------
 // -------------------- BOT UTILS START -----------------------
@@ -182,9 +187,9 @@ function generateDescription(info: VideoInfo) {
 // Handles callback queries from inline keyboard buttons
 
 class CallbackQueryHandler {
-    private ctx: Context;
     private inline_msg_id: number;
     private chat_id: number;
+    private original_user_msg_id: number;
     
     private video_id: string; // for better logging
     private url: string; // to be used for downloading
@@ -205,15 +210,16 @@ class CallbackQueryHandler {
     private inform: ReturnType<typeof getInform>;
 
     constructor(
-        ctx: Context,
+        private ctx: Context,
     ) {
-        this.ctx = ctx;
         this.inline_msg_id = ctx.callbackQuery!.message?.message_id!;
         this.chat_id = ctx.chatId!;
-        const [video_id, format, duration, height, width] = ctx.callbackQuery!.data!
+        const [video_id, format, duration, height, width, original_user_msg_id] = ctx.callbackQuery!.data!
             .split("|");
 
         this.video_id = video_id;
+        this.original_user_msg_id = parseInt(original_user_msg_id);
+        
         // some video IDs start with a -, which makes yt-dlp treat it as an argument and
         // instantly fail. So, I am wrapping the ID in a basic link
         this.url = `https://youtube.com/watch?v=${video_id}`
@@ -309,7 +315,7 @@ class CallbackQueryHandler {
      */
     send() {
         // primary variables  
-        const { ctx, isAudio, duration, height, width } = this;
+        const { ctx, isAudio, duration, height, width, url } = this;
         // file paths
         const { storedFilePath, thumbFilePath, descrFilePath } = this;
         // only for logging
@@ -333,6 +339,10 @@ class CallbackQueryHandler {
                 readErr,
             );
         }
+
+        // a decorative keyboard that adds the ability to copy the URL of the video
+        const copyButton = new InlineKeyboard().copyText("Copy URL", url);
+
         if (!isAudio) {
             return ctx.replyWithVideo(new InputFile(storedFilePath), {
                 cover: new InputFile(thumbFilePath),
@@ -341,6 +351,7 @@ class CallbackQueryHandler {
                 duration: parseInt(duration),
                 caption: videoDescr,
                 parse_mode: "HTML",
+                reply_markup: copyButton,
             });
         } else {
             let title = "";
@@ -364,6 +375,7 @@ class CallbackQueryHandler {
                 performer: author,
                 duration: parseInt(duration),
                 thumbnail: new InputFile(thumbFilePath),
+                reply_markup: copyButton
             });
         }
     }
@@ -393,17 +405,19 @@ class CallbackQueryHandler {
         log(`Cleanup complete.`);
     }
 
-    handle() {
+    async handle() {
         const { ctx, chat_id, inline_msg_id, video_id } = this;
         const { log, error } = this.logSuite();
         const inform = this.inform;
-        
+
         log(`Started downloading video for ${video_id}`);
         this.downloadFromLink()
             .then(async logs => {
                 log(logs);
                 await this.send()
                 this.cleanUpFiles()
+                log(`Trying to delete inline message ${inline_msg_id} and original user message ${this.original_user_msg_id}`);
+                await ctx.api.deleteMessage(chat_id, this.original_user_msg_id);
                 await ctx.api.deleteMessage(chat_id, inline_msg_id);
             })
             .catch((e) => {
@@ -415,9 +429,9 @@ class CallbackQueryHandler {
     }
 }
 
-bot.on("callback_query:data", (ctx) => {
+bot.on("callback_query:data", async (ctx) => {
     const handler = new CallbackQueryHandler(ctx);
-    handler.handle();
+    await handler.handle();
 });
 
 // ------------------ CALLBACK QUERY HANDLER END ----------------
@@ -444,10 +458,13 @@ function getQualityID(height: number): typeof allowedFormats[number] {
         return "4K"; // Or a specific label for very high resolutions if 4320 is not the max
     }
 class URLMessageHandler {
-    private ctx: Context;
-    private url: string;
-    private _bot_msg_id?: number; // message ID for the initial message
+    private valid: boolean = true; // whether the handler is valid and can process the message
+    isValid = () => this.valid; // getter
 
+    private url: string = "";
+    private _bot_msg_id?: number; // message ID for the initial message
+    private user_msg_id: number;
+    
     private get bot_msg_id() {
         if (this._bot_msg_id === undefined) {
             this.logSuite().error("Tried to access bot_msg_id before it was set.");
@@ -468,11 +485,22 @@ class URLMessageHandler {
     }
 
     constructor(
-        ctx: Context,
+        private ctx: Context,
     ) {
-        this.ctx = ctx;
-        this.url = ctx.message!.text!; // we know that this block can only trigger if url is present in the message
+        this.user_msg_id = ctx.message!.message_id;
         this.logSuite = (subprocess?: string) => getLogFunctions("MessageHandler", subprocess)
+        
+        const url = extractYoutubeURL(ctx.message!.text!);
+        if(!url) {
+            // if no URL is found, mark the handler as invalid
+            this.valid = false;
+            this.logSuite().log("No YouTube URL found in the message.");
+            ctx.reply(
+                "I can only process YouTube links. Send any YouTube link to receive an auto-formatted response, or request a specific result using commands.",
+            );
+            return;
+        }
+        this.url = url;
     }
 
     fetchVideoInfo() {
@@ -494,10 +522,7 @@ class URLMessageHandler {
      * and stores the description of the video in a file.
      */
     processVideoInfo(info: VideoInfo) {
-        const { url } = this;
         const { log, error } = this.logSuite("processVideoInfo");
-
-        console.log(info.formats)
 
         const video_id = info.id;
 
@@ -530,7 +555,7 @@ class URLMessageHandler {
             existingFormats[getQualityID(h)] = [fID, filesize, h, w];
         });
 
-        const videoDescr = generateDescription(info) + `\n${url}`;
+        const videoDescr = generateDescription(info) + `\n${this.url}`;
         try {
             writeFileSync(`${video_id}-descr.txt`, videoDescr);
             log(`Successfully wrote description for ${video_id} to file.`);
@@ -568,7 +593,7 @@ class URLMessageHandler {
 
         downloadMenuMarkup.text(
             `Music (≈${formatSize(largest_audio.filesize!)})`,
-            `${info.id}|ba|${info.duration}||`,
+            `${info.id}|ba|${info.duration}|||${this.user_msg_id}`,
         );
 
         Object.entries(existingFormats)
@@ -577,7 +602,7 @@ class URLMessageHandler {
                 downloadMenuMarkup.row();
                 downloadMenuMarkup.text(
                     `${res} (≤${formatSize(size + largest_audio.filesize!)})`,
-                    `${video_id}|${id}+ba|${info.duration}|${h}|${w}`,
+                    `${video_id}|${id}+ba|${info.duration}|${h}|${w}|${this.user_msg_id}`,
                 );
         });
 
@@ -585,16 +610,7 @@ class URLMessageHandler {
     }
 
     async handle() {
-        const { ctx, url } = this;
-        const { log, error } = this.logSuite();
-
-        if (!isYoutubeURL(url)) {
-            log("Rejected: Not a YouTube link");
-            ctx.reply(
-                "I can only process YouTube links. Send any YouTube link to receive an auto-formatted response, or request a specific result using commands.",
-            );
-            return;
-        }
+        const { error } = this.logSuite();
 
         await this.fetchVideoInfo()
             .then(info => {
@@ -614,7 +630,10 @@ class URLMessageHandler {
 }
 
 bot.on("message::url", async (ctx) => {
-    new URLMessageHandler(ctx).handle();
+    const handler = new URLMessageHandler(ctx);
+    if (handler.isValid()) {
+        await handler.handle();
+    } // error message has already been sent, no need for else
 });
 
 // -------------------- MESSAGE HANDLER END -------------------
@@ -626,30 +645,37 @@ bot.on("message::url", async (ctx) => {
  * and formats the response with the video description and link.
  */
 class FormatCommandHandler {
-    private url: string;
+    private valid: boolean = true; // whether the handler is valid and can process the message
+    isValid = () => this.valid; // getter
+
+    private url: string = "";
     private logSuite: (subprocess?: string) => LogSuite;
     private inform: ReturnType<typeof getInform>;
 
     constructor(
         private ctx: Context,
     ) {
-        this.url = ctx.message!.text!.split("/format ")[1];
-        
         this.inform = getInform(ctx, ctx.message!.message_id!);
         this.logSuite = (subprocess?: string) => getLogFunctions("FormatCommandHandler", subprocess);
+
+        const url = extractYoutubeURL(ctx.message!.text!.split("/format ")[1]);
+        if(url === undefined) {
+            // if no URL is found, terminate the handler
+            this.valid = false;
+            this.logSuite().log("No YouTube URL found in the command, terminating handler.");
+            ctx.reply(
+                "I can only process YouTube links. Send any YouTube link to receive an auto-formatted response, or request a specific result using commands.",
+            );
+            return;
+        }
+
+        this.url = url;
     }
 
     handle() {
         const { url } = this;
         const { log, error } = this.logSuite();
         const inform = this.inform;
-
-        if (!isYoutubeURL(url)) {
-            inform(
-                "This command only accepts YouTube links, and appends video descriptions to them.",
-            );
-            return;
-        }
 
         log(`Checking: ${url}`);
         inform("Gathering video info...");
@@ -672,7 +698,10 @@ class FormatCommandHandler {
  * Handles /format command.
  */
 bot.command("format", (ctx) => {
-    new FormatCommandHandler(ctx).handle();
+    const handler = new FormatCommandHandler(ctx);
+    if (handler.isValid()) {
+        handler.handle(); 
+    } // error message has already been sent, no need for else
 });
 
 // -------------------- COMMAND HANDLER END -------------------
